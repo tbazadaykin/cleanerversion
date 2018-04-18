@@ -33,7 +33,7 @@ from django.utils.timezone import utc
 
 from versions.exceptions import DeletionOfNonCurrentVersionError
 from versions.models import get_utc_now, ForeignKeyRequiresValueError, \
-    Versionable
+    Versionable, VersionManager, VersionedQuerySet, querytime
 from versions_tests.models import (
     Award, B, C1, C2, C3, City, Classroom, Directory, Fan, Mascot, NonFan,
     Observer, Person, Player, Professor, Pupil,
@@ -3230,3 +3230,39 @@ class DeferredFieldsTest(TestCase):
             'Can not restore a model instance that has deferred fields',
             c1_v1.restore
         )
+
+
+class VersionManagerTest(TestCase):
+    def test_from_queryset_with_descendant_of_versioned_query_set(self):
+        class MyVersionedQuerySet(VersionedQuerySet):
+            pass
+        m1 = VersionManager.from_queryset(MyVersionedQuerySet)
+        t1 = m1().get_queryset()
+        self.assertEqual(type(t1), MyVersionedQuerySet)
+
+    def test_from_queryset_with_descendant_of_not_versioned_query_set(self):
+        class MyNotVersionedQuerySet(object):
+            pass
+        self.assertRaises(
+            AssertionError,
+            VersionManager.from_queryset,
+            MyNotVersionedQuerySet
+        )
+
+
+class QueryTimeDecorator(TestCase):
+    def test_querytime_decorator(self):
+        ts = get_utc_now()
+
+        class Instanse(object):
+            _querytime = ts
+
+        class T(object):
+            instance = Instanse()
+
+            @querytime
+            def t(self):
+                return VersionedQuerySet()
+
+        t = T()
+        self.assertEqual(t.t().querytime, ts)

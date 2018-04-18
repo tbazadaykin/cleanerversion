@@ -46,252 +46,22 @@ def validate_uuid(uuid_obj):
     return isinstance(uuid_obj, uuid.UUID) and uuid_obj.version == 4
 
 
+def querytime(fn):
+    def wrapper(self, *args, **kwargs):
+        qs = fn(self, *args, **kwargs)
+        assert isinstance(qs, VersionedQuerySet),\
+            'Result is not an instance of VersionedQuerySet'
+        if hasattr(self, 'instance') and hasattr(self.instance, '_querytime'):
+            qs.querytime = self.instance._querytime
+        return qs
+    return wrapper
+
+
 QueryTime = namedtuple('QueryTime', 'time active')
 
 
 class ForeignKeyRequiresValueError(ValueError):
     pass
-
-
-class VersionManager(models.Manager):
-    """
-    This is the Manager-class for any class that inherits from Versionable
-    """
-    use_for_related_fields = True
-
-    def get_queryset(self):
-        """
-        Returns a VersionedQuerySet capable of handling version time
-        restrictions.
-
-        :return: VersionedQuerySet
-        """
-        qs = VersionedQuerySet(self.model, using=self._db)
-        if hasattr(self, 'instance') and hasattr(self.instance, '_querytime'):
-            qs.querytime = self.instance._querytime
-        return qs
-
-    def as_of(self, time=None):
-        """
-        Filters Versionables at a given time
-        :param time: The timestamp (including timezone info) at which
-        Versionables shall be retrieved
-        :return: A QuerySet containing the base for a timestamped query.
-        """
-        return self.get_queryset().as_of(time)
-
-    def next_version(self, object, relations_as_of='end'):
-        """
-        Return the next version of the given object.
-
-        In case there is no next object existing, meaning the given
-        object is the current version, the function returns this version.
-
-        Note that if object's version_end_date is None, this does not check
-        the database to see if there is a newer version (perhaps created by
-        some other code), it simply returns the passed object.
-
-        ``relations_as_of`` is used to fix the point in time for the version;
-        this affects which related objects are returned when querying for
-        object relations. See ``VersionManager.version_as_of`` for details
-        on valid ``relations_as_of`` values.
-
-        :param Versionable object: object whose next version will be returned.
-        :param mixed relations_as_of: determines point in time used to access
-            relations. 'start'|'end'|datetime|None
-        :return: Versionable
-        """
-        if object.version_end_date is None:
-            next = object
-        else:
-            next = self.filter(
-                Q(identity=object.identity),
-                Q(version_start_date__gte=object.version_end_date)
-            ).order_by('version_start_date').first()
-
-            if not next:
-                raise ObjectDoesNotExist(
-                    "next_version couldn't find a next version of object " +
-                    str(object.identity))
-
-        return self.adjust_version_as_of(next, relations_as_of)
-
-    def previous_version(self, object, relations_as_of='end'):
-        """
-        Return the previous version of the given object.
-
-        In case there is no previous object existing, meaning the given object
-        is the first version of the object, then the function returns this
-        version.
-
-        ``relations_as_of`` is used to fix the point in time for the version;
-        this affects which related objects are returned when querying for
-        object relations. See ``VersionManager.version_as_of`` for details on
-        valid ``relations_as_of`` values.
-
-        :param Versionable object: object whose previous version will be
-            returned.
-        :param mixed relations_as_of: determines point in time used to access
-            relations. 'start'|'end'|datetime|None
-        :return: Versionable
-        """
-        if object.version_birth_date == object.version_start_date:
-            previous = object
-        else:
-            previous = self.filter(
-                Q(identity=object.identity),
-                Q(version_end_date__lte=object.version_start_date)
-            ).order_by('-version_end_date').first()
-
-            if not previous:
-                raise ObjectDoesNotExist(
-                    "previous_version couldn't find a previous version of "
-                    "object " + str(object.identity))
-
-        return self.adjust_version_as_of(previous, relations_as_of)
-
-    def current_version(self, object, relations_as_of=None, check_db=False):
-        """
-        Return the current version of the given object.
-
-        The current version is the one having its version_end_date set to NULL.
-        If there is not such a version then it means the object has been
-        'deleted' and so there is no current version available. In this case
-        the function returns None.
-
-        Note that if check_db is False and object's version_end_date is None,
-        this does not check the database to see if there is a newer version
-        (perhaps created by some other code), it simply returns the passed
-        object.
-
-        ``relations_as_of`` is used to fix the point in time for the version;
-        this affects which related objects are returned when querying for
-        object relations. See ``VersionManager.version_as_of`` for details on
-        valid ``relations_as_of`` values.
-
-        :param Versionable object: object whose current version will be
-            returned.
-        :param mixed relations_as_of: determines point in time used to access
-            relations. 'start'|'end'|datetime|None
-        :param bool check_db: Whether or not to look in the database for a
-            more recent version
-        :return: Versionable
-        """
-        if object.version_end_date is None and not check_db:
-            current = object
-        else:
-            current = self.current.filter(identity=object.identity).first()
-
-        return self.adjust_version_as_of(current, relations_as_of)
-
-    @staticmethod
-    def adjust_version_as_of(version, relations_as_of):
-        """
-        Adjusts the passed version's as_of time to an appropriate value, and
-        returns it.
-
-        ``relations_as_of`` is used to fix the point in time for the version;
-        this affects which related objects are returned when querying for
-        object relations.
-        Valid ``relations_as_of`` values and how this affects the returned
-        version's as_of attribute:
-        - 'start': version start date
-        - 'end': version end date - 1 microsecond (no effect if version is
-            current version)
-        - datetime object: given datetime (raises ValueError if given datetime
-            not valid for version)
-        - None: unset (related object queries will not be restricted to a
-            point in time)
-
-        :param Versionable object: object whose as_of will be adjusted as
-            requested.
-        :param mixed relations_as_of: valid values are the strings 'start' or
-            'end', or a datetime object.
-        :return: Versionable
-        """
-        if not version:
-            return version
-
-        if relations_as_of == 'end':
-            if version.is_current:
-                # Ensure that version._querytime is active, in case it wasn't
-                # before.
-                version.as_of = None
-            else:
-                version.as_of = version.version_end_date - datetime.timedelta(
-                    microseconds=1)
-        elif relations_as_of == 'start':
-            version.as_of = version.version_start_date
-        elif isinstance(relations_as_of, datetime.datetime):
-            as_of = relations_as_of.astimezone(utc)
-            if not as_of >= version.version_start_date:
-                raise ValueError(
-                    "Provided as_of '{}' is earlier than version's start "
-                    "time '{}'".format(
-                        as_of.isoformat(),
-                        version.version_start_date.isoformat()
-                    )
-                )
-            if version.version_end_date is not None \
-                    and as_of >= version.version_end_date:
-                raise ValueError(
-                    "Provided as_of '{}' is later than version's start "
-                    "time '{}'".format(
-                        as_of.isoformat(),
-                        version.version_end_date.isoformat()
-                    )
-                )
-            version.as_of = as_of
-        elif relations_as_of is None:
-            version._querytime = QueryTime(time=None, active=False)
-        else:
-            raise TypeError(
-                "as_of parameter must be 'start', 'end', None, or datetime "
-                "object")
-
-        return version
-
-    @property
-    def current(self):
-        return self.as_of(None)
-
-    def create(self, **kwargs):
-        """
-        Creates an instance of a Versionable
-        :param kwargs: arguments used to initialize the class instance
-        :return: a Versionable instance of the class
-        """
-        return self._create_at(None, **kwargs)
-
-    def _create_at(self, timestamp=None, id=None, forced_identity=None,
-                   **kwargs):
-        """
-        WARNING: Only for internal use and testing.
-
-        Create a Versionable having a version_start_date and
-        version_birth_date set to some pre-defined timestamp
-
-        :param timestamp: point in time at which the instance has to be created
-        :param id: version 4 UUID unicode object.  Usually this is not
-            specified, it will be automatically created.
-        :param forced_identity: version 4 UUID unicode object.  For internal
-            use only.
-        :param kwargs: arguments needed for initializing the instance
-        :return: an instance of the class
-        """
-        id = Versionable.uuid(id)
-        if forced_identity:
-            ident = Versionable.uuid(forced_identity)
-        else:
-            ident = id
-
-        if timestamp is None:
-            timestamp = get_utc_now()
-        kwargs['id'] = id
-        kwargs['identity'] = ident
-        kwargs['version_start_date'] = timestamp
-        kwargs['version_birth_date'] = timestamp
-        return super(VersionManager, self).create(**kwargs)
 
 
 class VersionedWhereNode(WhereNode):
@@ -589,6 +359,253 @@ class VersionedQuerySet(QuerySet):
 
     delete.alters_data = True
     delete.queryset_only = True
+
+
+class VersionManager(models.Manager.from_queryset(VersionedQuerySet)):
+    """
+    This is the Manager-class for any class that inherits from Versionable
+    """
+    use_for_related_fields = True
+
+    @querytime
+    def get_queryset(self):
+        """
+        Returns a VersionedQuerySet capable of handling version time
+        restrictions.
+
+        :return: VersionedQuerySet
+        """
+        return super(VersionManager, self).get_queryset()
+
+    @classmethod
+    def from_queryset(cls, queryset_class, class_name=None):
+        assert issubclass(queryset_class, VersionedQuerySet),\
+            '{0} is not a subclass of VersionedQuerySet'.format(
+                queryset_class.__name__)
+        return super(VersionManager, cls).from_queryset(
+            queryset_class, class_name)
+
+    def as_of(self, time=None):
+        """
+        Filters Versionables at a given time
+        :param time: The timestamp (including timezone info) at which
+        Versionables shall be retrieved
+        :return: A QuerySet containing the base for a timestamped query.
+        """
+        return self.get_queryset().as_of(time)
+
+    def next_version(self, object, relations_as_of='end'):
+        """
+        Return the next version of the given object.
+
+        In case there is no next object existing, meaning the given
+        object is the current version, the function returns this version.
+
+        Note that if object's version_end_date is None, this does not check
+        the database to see if there is a newer version (perhaps created by
+        some other code), it simply returns the passed object.
+
+        ``relations_as_of`` is used to fix the point in time for the version;
+        this affects which related objects are returned when querying for
+        object relations. See ``VersionManager.version_as_of`` for details
+        on valid ``relations_as_of`` values.
+
+        :param Versionable object: object whose next version will be returned.
+        :param mixed relations_as_of: determines point in time used to access
+            relations. 'start'|'end'|datetime|None
+        :return: Versionable
+        """
+        if object.version_end_date is None:
+            next = object
+        else:
+            next = self.filter(
+                Q(identity=object.identity),
+                Q(version_start_date__gte=object.version_end_date)
+            ).order_by('version_start_date').first()
+
+            if not next:
+                raise ObjectDoesNotExist(
+                    "next_version couldn't find a next version of object " +
+                    str(object.identity))
+
+        return self.adjust_version_as_of(next, relations_as_of)
+
+    def previous_version(self, object, relations_as_of='end'):
+        """
+        Return the previous version of the given object.
+
+        In case there is no previous object existing, meaning the given object
+        is the first version of the object, then the function returns this
+        version.
+
+        ``relations_as_of`` is used to fix the point in time for the version;
+        this affects which related objects are returned when querying for
+        object relations. See ``VersionManager.version_as_of`` for details on
+        valid ``relations_as_of`` values.
+
+        :param Versionable object: object whose previous version will be
+            returned.
+        :param mixed relations_as_of: determines point in time used to access
+            relations. 'start'|'end'|datetime|None
+        :return: Versionable
+        """
+        if object.version_birth_date == object.version_start_date:
+            previous = object
+        else:
+            previous = self.filter(
+                Q(identity=object.identity),
+                Q(version_end_date__lte=object.version_start_date)
+            ).order_by('-version_end_date').first()
+
+            if not previous:
+                raise ObjectDoesNotExist(
+                    "previous_version couldn't find a previous version of "
+                    "object " + str(object.identity))
+
+        return self.adjust_version_as_of(previous, relations_as_of)
+
+    def current_version(self, object, relations_as_of=None, check_db=False):
+        """
+        Return the current version of the given object.
+
+        The current version is the one having its version_end_date set to NULL.
+        If there is not such a version then it means the object has been
+        'deleted' and so there is no current version available. In this case
+        the function returns None.
+
+        Note that if check_db is False and object's version_end_date is None,
+        this does not check the database to see if there is a newer version
+        (perhaps created by some other code), it simply returns the passed
+        object.
+
+        ``relations_as_of`` is used to fix the point in time for the version;
+        this affects which related objects are returned when querying for
+        object relations. See ``VersionManager.version_as_of`` for details on
+        valid ``relations_as_of`` values.
+
+        :param Versionable object: object whose current version will be
+            returned.
+        :param mixed relations_as_of: determines point in time used to access
+            relations. 'start'|'end'|datetime|None
+        :param bool check_db: Whether or not to look in the database for a
+            more recent version
+        :return: Versionable
+        """
+        if object.version_end_date is None and not check_db:
+            current = object
+        else:
+            current = self.current.filter(identity=object.identity).first()
+
+        return self.adjust_version_as_of(current, relations_as_of)
+
+    @staticmethod
+    def adjust_version_as_of(version, relations_as_of):
+        """
+        Adjusts the passed version's as_of time to an appropriate value, and
+        returns it.
+
+        ``relations_as_of`` is used to fix the point in time for the version;
+        this affects which related objects are returned when querying for
+        object relations.
+        Valid ``relations_as_of`` values and how this affects the returned
+        version's as_of attribute:
+        - 'start': version start date
+        - 'end': version end date - 1 microsecond (no effect if version is
+            current version)
+        - datetime object: given datetime (raises ValueError if given datetime
+            not valid for version)
+        - None: unset (related object queries will not be restricted to a
+            point in time)
+
+        :param Versionable object: object whose as_of will be adjusted as
+            requested.
+        :param mixed relations_as_of: valid values are the strings 'start' or
+            'end', or a datetime object.
+        :return: Versionable
+        """
+        if not version:
+            return version
+
+        if relations_as_of == 'end':
+            if version.is_current:
+                # Ensure that version._querytime is active, in case it wasn't
+                # before.
+                version.as_of = None
+            else:
+                version.as_of = version.version_end_date - datetime.timedelta(
+                    microseconds=1)
+        elif relations_as_of == 'start':
+            version.as_of = version.version_start_date
+        elif isinstance(relations_as_of, datetime.datetime):
+            as_of = relations_as_of.astimezone(utc)
+            if not as_of >= version.version_start_date:
+                raise ValueError(
+                    "Provided as_of '{}' is earlier than version's start "
+                    "time '{}'".format(
+                        as_of.isoformat(),
+                        version.version_start_date.isoformat()
+                    )
+                )
+            if version.version_end_date is not None \
+                    and as_of >= version.version_end_date:
+                raise ValueError(
+                    "Provided as_of '{}' is later than version's start "
+                    "time '{}'".format(
+                        as_of.isoformat(),
+                        version.version_end_date.isoformat()
+                    )
+                )
+            version.as_of = as_of
+        elif relations_as_of is None:
+            version._querytime = QueryTime(time=None, active=False)
+        else:
+            raise TypeError(
+                "as_of parameter must be 'start', 'end', None, or datetime "
+                "object")
+
+        return version
+
+    @property
+    def current(self):
+        return self.as_of(None)
+
+    def create(self, **kwargs):
+        """
+        Creates an instance of a Versionable
+        :param kwargs: arguments used to initialize the class instance
+        :return: a Versionable instance of the class
+        """
+        return self._create_at(None, **kwargs)
+
+    def _create_at(self, timestamp=None, id=None, forced_identity=None,
+                   **kwargs):
+        """
+        WARNING: Only for internal use and testing.
+
+        Create a Versionable having a version_start_date and
+        version_birth_date set to some pre-defined timestamp
+
+        :param timestamp: point in time at which the instance has to be created
+        :param id: version 4 UUID unicode object.  Usually this is not
+            specified, it will be automatically created.
+        :param forced_identity: version 4 UUID unicode object.  For internal
+            use only.
+        :param kwargs: arguments needed for initializing the instance
+        :return: an instance of the class
+        """
+        id = Versionable.uuid(id)
+        if forced_identity:
+            ident = Versionable.uuid(forced_identity)
+        else:
+            ident = id
+
+        if timestamp is None:
+            timestamp = get_utc_now()
+        kwargs['id'] = id
+        kwargs['identity'] = ident
+        kwargs['version_start_date'] = timestamp
+        kwargs['version_birth_date'] = timestamp
+        return super(VersionManager, self).create(**kwargs)
 
 
 class Versionable(models.Model):
